@@ -1,9 +1,24 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-type BrowserProfile = {
+export type ProxyConfig = {
+  type: 'direct' | 'http' | 'socks5'
+  host: string
+  port: string
+  username: string
+  password: string
+}
+
+export type BrowserProfile = {
   id: string
   name: string
   createdAt: string
+  userAgent: string
+  proxy: ProxyConfig
+}
+
+export type ProfileSettings = {
+  userAgent: string
+  proxy: ProxyConfig
 }
 
 contextBridge.exposeInMainWorld('upNetwork', {
@@ -13,10 +28,24 @@ contextBridge.exposeInMainWorld('upNetwork', {
   listProfiles: (): Promise<BrowserProfile[]> =>
     ipcRenderer.invoke('profiles:list'),
 
-  createProfile: (name: string): Promise<BrowserProfile> =>
-    ipcRenderer.invoke('profiles:create', name),
+  createProfile: (
+    input: string | {
+      name: string
+      userAgent?: string
+      proxy?: ProxyConfig
+    }
+  ): Promise<BrowserProfile> =>
+    ipcRenderer.invoke('profiles:create', input),
 
-  openProfile: (id: string): Promise<{ opened: boolean; profileId: string }> =>
+  updateProfileSettings: (
+    id: string,
+    settings: ProfileSettings
+  ): Promise<BrowserProfile> =>
+    ipcRenderer.invoke('profiles:update-settings', id, settings),
+
+  openProfile: (
+    id: string
+  ): Promise<{ opened: boolean; profileId: string }> =>
     ipcRenderer.invoke('profiles:open', id),
 
   deleteProfile: (
