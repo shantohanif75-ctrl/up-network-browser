@@ -3,20 +3,76 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 
+type ProxyConfig = {
+  type: 'direct' | 'http' | 'socks5'
+  host: string
+  port: string
+  username: string
+  password: string
+}
+
 type BrowserProfile = {
   id: string
   name: string
   createdAt: string
+  userAgent: string
+  proxy: ProxyConfig
 }
+
+const directProxy = (): ProxyConfig => ({
+  type: 'direct',
+  host: '',
+  port: '',
+  username: '',
+  password: ''
+})
 
 let mainWindow: BrowserWindow | null = null
 let profiles: BrowserProfile[] = []
 const profileWindows = new Map<string, BrowserWindow>()
+const sessionProxies = new Map<Electron.Session, ProxyConfig>()
 
-const profilesFile = () => join(app.getPath('userData'), 'profiles.json')
+const profilesFile = () =>
+  join(app.getPath('userData'), 'profiles.json')
 
 function isValidProfileId(id: unknown): id is string {
   return typeof id === 'string' && /^[a-f0-9-]{36}$/i.test(id)
+}
+
+function normalizeProfile(value: unknown): BrowserProfile | null {
+  if (!value || typeof value !== 'object') return null
+
+  const p = value as Partial<BrowserProfile>
+
+  if (
+    !isValidProfileId(p.id) ||
+    typeof p.name !== 'string' ||
+    typeof p.createdAt !== 'string'
+  ) {
+    return null
+  }
+
+  const oldProxy = p.proxy
+  const proxy: ProxyConfig = {
+    type:
+      oldProxy?.type === 'http' || oldProxy?.type === 'socks5'
+        ? oldProxy.type
+        : 'direct',
+    host: typeof oldProxy?.host === 'string' ? oldProxy.host : '',
+    port: typeof oldProxy?.port === 'string' ? oldProxy.port : '',
+    username:
+      typeof oldProxy?.username === 'string' ? oldProxy.username : '',
+    password:
+      typeof oldProxy?.password === 'string' ? oldProxy.password : ''
+  }
+
+  return {
+    id: p.id,
+    name: p.name,
+    createdAt: p.createdAt,
+    userAgent: typeof p.userAgent === 'string' ? p.userAgent : '',
+    proxy
+  }
 }
 
 async function saveProfiles() {
@@ -28,25 +84,124 @@ async function loadProfiles() {
   try {
     const content = await readFile(profilesFile(), 'utf8')
     const saved: unknown = JSON.parse(content)
-
-    if (Array.isArray(saved)) {
-      profiles = saved.filter(
-        (p): p is BrowserProfile =>
-          p !== null &&
-          typeof p === 'object' &&
-          isValidProfileId((p as BrowserProfile).id) &&
-          typeof (p as BrowserProfile).name === 'string' &&
-          typeof (p as BrowserProfile).createdAt === 'string'
-      )
-    }
+    profiles = Array.isArray(saved)
+      ? saved.map(normalizeProfile).filter(
+          (p): p is BrowserProfile => p !== null
+        )
+      : []
   } catch {
     profiles = []
     await saveProfiles()
   }
 }
 
+function validateProxy(value: unknown): ProxyConfig {
+  if (!value || typeof value !== 'object') {
+    return directProxy()
+  }
+
+  const p = value as Partial<ProxyConfig>
+
+  if (!p.type || p.type === 'direct') return directProxy()
+
+  if (p.type !== 'http' && p.type !== 'socks5') {
+    throw new Error('Choose a supported proxy type.')
+  }
+
+  const host = typeof p.host === 'string' ? p.host.trim() : ''
+  const port = typeof p.port === 'string' ? p.port.trim() : ''
+
+  if (
+    !host ||
+    host.length > 253 ||
+    /[\s/@?#]/.test(host) ||
+    !/^\d{1,5}$/.test(port) ||
+    Number(port) < 1 ||
+    Number(port) > 65535
+  ) {
+    throw new Error('Enter a valid proxy host and port.')
+  }
+
+  return {
+    type: p.type,
+    host,
+    port,
+    username: typeof p.username === 'string' ? p.username : '',
+    password: typeof p.password === 'string' ? p.password : ''
+  }
+}
+
+function validateUserAgent(value: unknown): string {
+  if (value === undefined || value === null || value === '') return ''
+
+  if (
+    typeof value !== 'string' ||
+    value.length > 1024 ||
+    /[\r\n]/.test(value)
+  ) {
+    throw new Error('Enter a valid User-Agent string.')
+  }
+
+  return value.trim()
+}
+
 function getProfileSession(profileId: string) {
   return session.fromPartition(`persist:profile-${profileId}`)
+}
+
+async function applyProfileSettings(profile: BrowserProfile) {
+  const ses = getProfileSession(profile.id)
+  const proxy = profile.proxy
+
+  sessionProxies.set(ses, proxy)
+
+  if (proxy.type === 'direct') {
+    await ses.setProxy({ mode: 'direct' })
+  } else {
+    const rules =
+      proxy.type === 'http'
+        ? `http=${proxy.host}:${proxy.port};https=${proxy.host}:${proxy.port}`
+        : `socks5://${proxy.host}:${proxy.port}`
+
+    await ses.setProxy({ proxyRules: rules })
+  }
+
+  await ses.forceReloadProxyConfig()
+}
+
+function installProxyAuthenticationHandler() {
+  app.on('login', (event, webContents, _details, authInfo, callback) => {
+    if (!authInfo.isProxy) return
+
+    const proxy = sessionProxies.get(webContents.session)
+
+    if (
+      !proxy ||
+      !proxy.username ||
+      proxy.type === 'direct'
+    ) {
+      return
+    }
+
+    event.preventDefault()
+    callback(proxy.username, proxy.password)
+  })
+}
+
+function setSafeExternalLinks(win: BrowserWindow) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const target = new URL(url)
+
+      if (target.protocol === 'https:' || target.protocol === 'http:') {
+        void shell.openExternal(target.toString())
+      }
+    } catch {
+      // Reject invalid URLs.
+    }
+
+    return { action: 'deny' }
+  })
 }
 
 function createMainWindow() {
@@ -65,17 +220,7 @@ function createMainWindow() {
     }
   })
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const target = new URL(url)
-      if (target.protocol === 'https:' || target.protocol === 'http:') {
-        void shell.openExternal(target.toString())
-      }
-    } catch {
-      // Reject invalid URLs.
-    }
-    return { action: 'deny' }
-  })
+  setSafeExternalLinks(mainWindow)
 
   if (process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -88,7 +233,7 @@ function createMainWindow() {
   })
 }
 
-function openProfileWindow(profile: BrowserProfile) {
+async function openProfileWindow(profile: BrowserProfile) {
   const existing = profileWindows.get(profile.id)
 
   if (existing && !existing.isDestroyed()) {
@@ -96,33 +241,25 @@ function openProfileWindow(profile: BrowserProfile) {
     return existing
   }
 
-  const profileSession = getProfileSession(profile.id)
+  await applyProfileSettings(profile)
 
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
     title: `${profile.name} — Up Network Browser`,
     webPreferences: {
-      session: profileSession,
+      session: getProfileSession(profile.id),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true
     }
   })
 
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const target = new URL(url)
+  setSafeExternalLinks(win)
 
-      if (target.protocol === 'https:' || target.protocol === 'http:') {
-        void shell.openExternal(target.toString())
-      }
-    } catch {
-      // Reject invalid URLs.
-    }
-
-    return { action: 'deny' }
-  })
+  if (profile.userAgent) {
+    win.webContents.setUserAgent(profile.userAgent)
+  }
 
   profileWindows.set(profile.id, win)
 
@@ -130,14 +267,14 @@ function openProfileWindow(profile: BrowserProfile) {
     profileWindows.delete(profile.id)
   })
 
-  void win.loadURL('https://www.google.com')
+  await win.loadURL('https://www.google.com')
   return win
 }
 
 function validateHttpUrl(rawUrl: unknown): URL {
   if (
     typeof rawUrl !== 'string' ||
-    rawUrl.trim().length === 0 ||
+    !rawUrl.trim() ||
     rawUrl.length > 2048
   ) {
     throw new Error('Enter a valid website address.')
@@ -163,75 +300,116 @@ function validateHttpUrl(rawUrl: unknown): URL {
 
 app.whenReady().then(async () => {
   await loadProfiles()
+  installProxyAuthenticationHandler()
 
   ipcMain.handle('profiles:list', () => profiles)
 
-  ipcMain.handle('profiles:create', async (_event, rawName: unknown) => {
-    if (typeof rawName !== 'string' || !rawName.trim()) {
+  ipcMain.handle('profiles:create', async (_event, input: unknown) => {
+    // Accept old calls that pass only a name.
+    const data =
+      typeof input === 'string'
+        ? { name: input }
+        : (input as {
+            name?: unknown
+            userAgent?: unknown
+            proxy?: unknown
+          } | null)
+
+    if (typeof data?.name !== 'string' || !data.name.trim()) {
       throw new Error('Enter a profile name.')
     }
 
-    if (rawName.trim().length > 60) {
+    if (data.name.trim().length > 60) {
       throw new Error('Profile name must be 60 characters or less.')
     }
 
     const profile: BrowserProfile = {
       id: randomUUID(),
-      name: rawName.trim(),
-      createdAt: new Date().toISOString()
+      name: data.name.trim(),
+      createdAt: new Date().toISOString(),
+      userAgent: validateUserAgent(data.userAgent),
+      proxy: validateProxy(data.proxy)
     }
 
     profiles.push(profile)
-    await saveProfiles()
+
+    try {
+      await saveProfiles()
+    } catch (error) {
+      profiles = profiles.filter((p) => p.id !== profile.id)
+      throw error
+    }
 
     return profile
   })
 
-  ipcMain.handle('profiles:open', (_event, rawId: unknown) => {
-    if (!isValidProfileId(rawId)) {
-      throw new Error('Invalid profile.')
+  ipcMain.handle('profiles:update-settings', async (_event, id, settings) => {
+    if (!isValidProfileId(id)) throw new Error('Invalid profile.')
+
+    const profile = profiles.find((p) => p.id === id)
+    if (!profile) throw new Error('Profile not found.')
+
+    const data = settings as {
+      userAgent?: unknown
+      proxy?: unknown
     }
+
+    const updated: BrowserProfile = {
+      ...profile,
+      userAgent: validateUserAgent(data?.userAgent),
+      proxy: validateProxy(data?.proxy)
+    }
+
+    const oldProfile = { ...profile, proxy: { ...profile.proxy } }
+    Object.assign(profile, updated)
+
+    try {
+      await saveProfiles()
+      await applyProfileSettings(profile)
+
+      const win = profileWindows.get(id)
+      if (win && !win.isDestroyed()) {
+        win.webContents.setUserAgent(
+          profile.userAgent || app.userAgentFallback
+        )
+        await win.webContents.reload()
+      }
+    } catch (error) {
+      Object.assign(profile, oldProfile)
+      await saveProfiles()
+      throw error
+    }
+
+    return profile
+  })
+
+  ipcMain.handle('profiles:open', async (_event, rawId: unknown) => {
+    if (!isValidProfileId(rawId)) throw new Error('Invalid profile.')
 
     const profile = profiles.find((p) => p.id === rawId)
+    if (!profile) throw new Error('Profile not found.')
 
-    if (!profile) {
-      throw new Error('Profile not found.')
-    }
-
-    openProfileWindow(profile)
+    await openProfileWindow(profile)
     return { opened: true, profileId: profile.id }
   })
 
   ipcMain.handle(
     'profiles:delete',
     async (_event, rawId: unknown, confirmDelete: unknown) => {
-      if (!isValidProfileId(rawId)) {
-        throw new Error('Invalid profile.')
-      }
-
-      if (confirmDelete !== true) {
-        throw new Error('Confirm profile deletion first.')
-      }
+      if (!isValidProfileId(rawId)) throw new Error('Invalid profile.')
+      if (confirmDelete !== true) throw new Error('Confirm deletion first.')
 
       const index = profiles.findIndex((p) => p.id === rawId)
-
-      if (index === -1) {
-        throw new Error('Profile not found.')
-      }
+      if (index === -1) throw new Error('Profile not found.')
 
       const win = profileWindows.get(rawId)
-
-      if (win && !win.isDestroyed()) {
-        win.destroy()
-      }
+      if (win && !win.isDestroyed()) win.destroy()
 
       profileWindows.delete(rawId)
       profiles.splice(index, 1)
       await saveProfiles()
 
-      // Profile data is deliberately retained.
-      // Storage is not cleared automatically when deleting a profile.
-
+      // The profile's browser data is intentionally retained.
       return { deleted: true, profileId: rawId }
     }
   )
@@ -247,22 +425,20 @@ app.whenReady().then(async () => {
         }
 
         const profile = profiles.find((p) => p.id === rawProfileId)
+        if (!profile) throw new Error('Profile not found.')
 
-        if (!profile) {
-          throw new Error('Profile not found.')
-        }
-
-        const win = openProfileWindow(profile)
+        const win = await openProfileWindow(profile)
         await win.loadURL(target.toString())
 
-        return { opened: true, url: target.toString(), profileId: profile.id }
+        return {
+          opened: true,
+          url: target.toString(),
+          profileId: profile.id
+        }
       }
 
       const parent = BrowserWindow.getFocusedWindow()
-
-      if (!parent) {
-        throw new Error('Browser window is not available.')
-      }
+      if (!parent) throw new Error('Browser window is not available.')
 
       const view = new BrowserWindow({
         width: 1200,
@@ -277,21 +453,9 @@ app.whenReady().then(async () => {
         }
       })
 
-      view.webContents.setWindowOpenHandler(({ url }) => {
-        try {
-          const external = new URL(url)
-
-          if (['http:', 'https:'].includes(external.protocol)) {
-            void shell.openExternal(external.toString())
-          }
-        } catch {
-          // Reject invalid URLs.
-        }
-
-        return { action: 'deny' }
-      })
-
+      setSafeExternalLinks(view)
       await view.loadURL(target.toString())
+
       return { opened: true, url: target.toString() }
     }
   )
@@ -299,14 +463,10 @@ app.whenReady().then(async () => {
   createMainWindow()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow()
-    }
+    if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
   })
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+  if (process.platform !== 'darwin') app.quit()
 })
