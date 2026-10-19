@@ -1,6 +1,6 @@
 {
   "name": "up-network-browser",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Up Network Browser - privacy-focused desktop browser starter",
   "main": "./out/main/index.js",
@@ -12,6 +12,7 @@
     "dist:win": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {
+    "electron-updater": "^6.6.2",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -37,6 +38,14 @@
       "out/**/*",
       "package.json"
     ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "shantohanif75-ctrl",
+        "repo": "up-network-browser",
+        "releaseType": "release"
+      }
+    ],
     "win": {
       "target": [
         {
@@ -52,5 +61,4 @@
       "allowToChangeInstallationDirectory": true
     }
   }
-  
 }
