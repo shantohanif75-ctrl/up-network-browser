@@ -52,5 +52,13 @@ contextBridge.exposeInMainWorld('upNetwork', {
     id: string,
     confirmDelete: boolean
   ): Promise<{ deleted: boolean; profileId: string }> =>
-    ipcRenderer.invoke('profiles:delete', id, confirmDelete)
+    ipcRenderer.invoke('profiles:delete', id, confirmDelete),
+
+  testProxy: (
+    profileId: string
+  ): Promise<{
+    success: boolean
+    ip: string
+    proxyType: 'http' | 'socks5'
+  }> => ipcRenderer.invoke('proxy:test', profileId)
 })
