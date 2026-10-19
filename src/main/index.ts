@@ -1,4 +1,12 @@
-import { app, BrowserWindow, ipcMain, session, shell } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  session,
+  shell
+} from 'electron'
+import { autoUpdater } from 'electron-updater'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
@@ -29,6 +37,7 @@ const directProxy = (): ProxyConfig => ({
 
 let mainWindow: BrowserWindow | null = null
 let profiles: BrowserProfile[] = []
+
 const profileWindows = new Map<string, BrowserWindow>()
 const sessionProxies = new Map<Electron.Session, ProxyConfig>()
 
@@ -53,6 +62,7 @@ function normalizeProfile(value: unknown): BrowserProfile | null {
   }
 
   const oldProxy = p.proxy
+
   const proxy: ProxyConfig = {
     type:
       oldProxy?.type === 'http' || oldProxy?.type === 'socks5'
@@ -84,10 +94,11 @@ async function loadProfiles() {
   try {
     const content = await readFile(profilesFile(), 'utf8')
     const saved: unknown = JSON.parse(content)
+
     profiles = Array.isArray(saved)
-      ? saved.map(normalizeProfile).filter(
-          (p): p is BrowserProfile => p !== null
-        )
+      ? saved
+          .map(normalizeProfile)
+          .filter((p): p is BrowserProfile => p !== null)
       : []
   } catch {
     profiles = []
@@ -175,11 +186,7 @@ function installProxyAuthenticationHandler() {
 
     const proxy = sessionProxies.get(webContents.session)
 
-    if (
-      !proxy ||
-      !proxy.username ||
-      proxy.type === 'direct'
-    ) {
+    if (!proxy || !proxy.username || proxy.type === 'direct') {
       return
     }
 
@@ -202,6 +209,70 @@ function setSafeExternalLinks(win: BrowserWindow) {
 
     return { action: 'deny' }
   })
+}
+
+/**
+ * Auto Update
+ *
+ * Updates are checked only in the packaged application.
+ * electron-builder must publish the installer and latest.yml
+ * to a GitHub Release for this repository.
+ */
+function setupAutoUpdates() {
+  if (!app.isPackaged) return
+
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+
+  autoUpdater.on('error', (error) => {
+    console.error('Auto update error:', error)
+  })
+
+  autoUpdater.on('update-available', (info) => {
+    console.log(`Update available: ${info.version}`)
+  })
+
+  autoUpdater.on('update-not-available', (info) => {
+    console.log(`Browser is up to date: ${info.version}`)
+  })
+
+  autoUpdater.on('download-progress', (progress) => {
+    console.log(`Update download progress: ${Math.round(progress.percent)}%`)
+  })
+
+  autoUpdater.on('update-downloaded', async (info) => {
+    try {
+      const result = await dialog.showMessageBox({
+        type: 'info',
+        title: 'Up Network Browser Update',
+        message: `Version ${info.version} is ready to install.`,
+        detail:
+          'Restart the browser now to install the update. Choose Later to continue working; the downloaded update will install when you quit the browser.',
+        buttons: ['Restart now', 'Later'],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true
+      })
+
+      if (result.response === 0) {
+        autoUpdater.quitAndInstall(false, true)
+      }
+    } catch (error) {
+      console.error('Could not show update dialog:', error)
+    }
+  })
+
+  const checkForUpdates = () => {
+    void autoUpdater.checkForUpdates().catch((error) => {
+      console.error('Could not check for updates:', error)
+    })
+  }
+
+  // Check once at startup.
+  checkForUpdates()
+
+  // Check again every four hours.
+  setInterval(checkForUpdates, 4 * 60 * 60 * 1000)
 }
 
 function createMainWindow() {
@@ -284,6 +355,7 @@ function validateHttpUrl(rawUrl: unknown): URL {
 
   try {
     const candidate = rawUrl.trim()
+
     target = new URL(
       candidate.includes('://') ? candidate : `https://${candidate}`
     )
@@ -395,45 +467,49 @@ app.whenReady().then(async () => {
     return profile
   })
 
-  ipcMain.handle('profiles:update-settings', async (_event, id, settings) => {
-    if (!isValidProfileId(id)) throw new Error('Invalid profile.')
+  ipcMain.handle(
+    'profiles:update-settings',
+    async (_event, id, settings) => {
+      if (!isValidProfileId(id)) throw new Error('Invalid profile.')
 
-    const profile = profiles.find((p) => p.id === id)
-    if (!profile) throw new Error('Profile not found.')
+      const profile = profiles.find((p) => p.id === id)
+      if (!profile) throw new Error('Profile not found.')
 
-    const data = settings as {
-      userAgent?: unknown
-      proxy?: unknown
-    }
-
-    const updated: BrowserProfile = {
-      ...profile,
-      userAgent: validateUserAgent(data?.userAgent),
-      proxy: validateProxy(data?.proxy)
-    }
-
-    const oldProfile = { ...profile, proxy: { ...profile.proxy } }
-    Object.assign(profile, updated)
-
-    try {
-      await saveProfiles()
-      await applyProfileSettings(profile)
-
-      const win = profileWindows.get(id)
-      if (win && !win.isDestroyed()) {
-        win.webContents.setUserAgent(
-          profile.userAgent || app.userAgentFallback
-        )
-        await win.webContents.reload()
+      const data = settings as {
+        userAgent?: unknown
+        proxy?: unknown
       }
-    } catch (error) {
-      Object.assign(profile, oldProfile)
-      await saveProfiles()
-      throw error
-    }
 
-    return profile
-  })
+      const updated: BrowserProfile = {
+        ...profile,
+        userAgent: validateUserAgent(data?.userAgent),
+        proxy: validateProxy(data?.proxy)
+      }
+
+      const oldProfile = { ...profile, proxy: { ...profile.proxy } }
+      Object.assign(profile, updated)
+
+      try {
+        await saveProfiles()
+        await applyProfileSettings(profile)
+
+        const win = profileWindows.get(id)
+
+        if (win && !win.isDestroyed()) {
+          win.webContents.setUserAgent(
+            profile.userAgent || app.userAgentFallback
+          )
+          await win.webContents.reload()
+        }
+      } catch (error) {
+        Object.assign(profile, oldProfile)
+        await saveProfiles()
+        throw error
+      }
+
+      return profile
+    }
+  )
 
   ipcMain.handle('profiles:open', async (_event, rawId: unknown) => {
     if (!isValidProfileId(rawId)) throw new Error('Invalid profile.')
@@ -449,7 +525,9 @@ app.whenReady().then(async () => {
     'profiles:delete',
     async (_event, rawId: unknown, confirmDelete: unknown) => {
       if (!isValidProfileId(rawId)) throw new Error('Invalid profile.')
-      if (confirmDelete !== true) throw new Error('Confirm deletion first.')
+      if (confirmDelete !== true) {
+        throw new Error('Confirm deletion first.')
+      }
 
       const index = profiles.findIndex((p) => p.id === rawId)
       if (index === -1) throw new Error('Profile not found.')
@@ -490,7 +568,10 @@ app.whenReady().then(async () => {
       }
 
       const parent = BrowserWindow.getFocusedWindow()
-      if (!parent) throw new Error('Browser window is not available.')
+
+      if (!parent) {
+        throw new Error('Browser window is not available.')
+      }
 
       const view = new BrowserWindow({
         width: 1200,
@@ -514,8 +595,13 @@ app.whenReady().then(async () => {
 
   createMainWindow()
 
+  // Enable automatic updates in the installed/packaged application.
+  setupAutoUpdates()
+
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createMainWindow()
+    }
   })
 })
 
