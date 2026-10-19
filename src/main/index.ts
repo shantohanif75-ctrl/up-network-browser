@@ -304,8 +304,60 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('profiles:list', () => profiles)
 
+  // Test a profile's configured proxy and retrieve its public IP.
+  ipcMain.handle('proxy:test', async (_event, rawId: unknown) => {
+    if (!isValidProfileId(rawId)) {
+      throw new Error('Invalid profile.')
+    }
+
+    const profile = profiles.find((p) => p.id === rawId)
+
+    if (!profile) {
+      throw new Error('Profile not found.')
+    }
+
+    if (profile.proxy.type === 'direct') {
+      throw new Error('এই প্রোফাইলে Proxy সেট করা নেই।')
+    }
+
+    await applyProfileSettings(profile)
+
+    const ses = getProfileSession(profile.id)
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 15000)
+
+    try {
+      const response = await ses.fetch(
+        'https://api.ipify.org?format=json',
+        { signal: controller.signal }
+      )
+
+      if (!response.ok) {
+        throw new Error(`IP service returned HTTP ${response.status}.`)
+      }
+
+      const result = await response.json() as { ip?: string }
+
+      if (!result.ip) {
+        throw new Error('Public IP পাওয়া যায়নি।')
+      }
+
+      return {
+        success: true,
+        ip: result.ip,
+        proxyType: profile.proxy.type
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Connection error'
+
+      throw new Error(`Proxy test failed: ${message}`)
+    } finally {
+      clearTimeout(timeout)
+    }
+  })
+
   ipcMain.handle('profiles:create', async (_event, input: unknown) => {
-    // Accept old calls that pass only a name.
     const data =
       typeof input === 'string'
         ? { name: input }
